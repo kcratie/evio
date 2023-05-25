@@ -400,26 +400,6 @@ class EvioSwitch:
         }
         return str(state)
 
-    def ingress_contains(self, mac) -> bool:
-        return mac in self._ingress_tbl
-
-    def get_ingress_port(self, mac) -> Optional[int]:
-        # return the best egress to reach the given mac
-        psw: Optional[PeerData] = self._root_sw_tbl.get(mac)
-        if psw and psw.port_no:
-            return psw.port_no
-        return self._ingress_tbl.get(mac)
-
-    def set_ingress_port(self, key_mac, value: Union[tuple, str]):
-        if isinstance(value, tuple):
-            self._learn(src_mac=key_mac, in_port=value[0], rnid=value[1])
-        else:
-            self._learn(key_mac, value)
-
-    def remove_ingress_port(self, mac):
-        self._ingress_tbl.pop(mac, None)
-        self._root_sw_tbl.pop(mac, None)
-
     def __iter__(self):
         if hasattr(self, "_REFLECT"):
             keys = self._REFLECT
@@ -435,13 +415,56 @@ class EvioSwitch:
             else len(self.__dict__.keys())
         )
 
+    def ingress_contains(self, mac) -> bool:
+        return mac in self._ingress_tbl
+
+    def get_ingress_port(self, mac) -> Optional[int]:
+        # return the best egress to reach the given mac
+        psw: Optional[PeerData] = self._root_sw_tbl.get(mac)
+        if psw and psw.port_no:
+            return psw.port_no
+        return self._ingress_tbl.get(mac)
+
+    def remove_ingress_port(self, mac):
+        self._ingress_tbl.pop(mac, None)
+        self._root_sw_tbl.pop(mac, None)
+
+    def set_ingress_port(self, key_mac, value: Union[tuple, str]):
+        if isinstance(value, tuple):
+            self._learn(src_mac=key_mac, in_port=value[0], rnid=value[1])
+        else:
+            self._learn(key_mac, value)
+
+    def _learn(self, src_mac, in_port, rnid=None):
+        """
+        Associate the mac with the ingress port. If the RNID is provided it indicates the peer
+        switch that hosts the leaf mac.
+        """
+        self._ingress_tbl[src_mac] = in_port
+        if rnid:
+            pd = self._register_peer(
+                peer_id=rnid,
+                leaf_macs=[
+                    src_mac,
+                ],
+            )
+            self._root_sw_tbl[src_mac] = pd
+            self.logger.debug(
+                f"learn sw:{self.name}, leaf_mac:{src_mac}, ingress:{in_port}, peerid:{rnid}"
+            )
+        elif in_port in self._leaf_prts:
+            self._leaf_macs.add(src_mac)
+            self.logger.debug(
+                f"learn sw:{self.name}, leaf_mac:{src_mac}, ingress:{in_port}"
+            )
+
     def _register_peer(
         self,
-        peer_id,
-        in_port=None,
-        peer_hw_addr=None,
+        peer_id: str,
+        in_port: Optional[int] = None,
+        peer_hw_addr: str = None,
         leaf_macs: Optional[list] = None,
-        hop_count=None,
+        hop_count: Optional[int] = None,
     ) -> PeerData:
         if peer_id not in self._peer_tbl:
             self._peer_tbl[peer_id] = PeerData(peer_id)
@@ -453,14 +476,15 @@ class EvioSwitch:
         )
         return self._peer_tbl[peer_id]
 
-    def _deregister_peer(self, peer_id):
+    def _deregister_peer(self, peer_id: str):
         """
         Clear port_no to indicate the tunnel is removed, ie., switch is no longer adjacent
-        although it may be accessible via hops.
+        although it may be accessible via hops. The pendant MACs hosted by the peer is kept
+        for updating flow rules.
         """
         if peer_id and peer_id in self._peer_tbl:
             self._peer_tbl[peer_id].port_no = None
-            self._peer_tbl[peer_id].leaf_macs.clear()
+            # self._peer_tbl[peer_id].leaf_macs.clear()
 
     @property
     def name(self) -> str:
@@ -500,6 +524,10 @@ class EvioSwitch:
         for port_no in self._link_prts:
             pl.append(self._port_tbl[port_no].peer_data.node_id)
         return pl
+
+    @property
+    def local_leaf_macs(self):
+        return self._leaf_macs
 
     def peer(self, peer_id) -> PeerData:
         return self._peer_tbl[peer_id]
@@ -632,33 +660,6 @@ class EvioSwitch:
                 f"has not yet been updated beyond seq {self._topo_seq}"
             )
         return updated
-
-    def _learn(self, src_mac, in_port, rnid=None):
-        """
-        Associate the mac with the ingress port. If the RNID is provided it indicates the peer
-        switch that hosts the leaf mac.
-        """
-        self._ingress_tbl[src_mac] = in_port
-        if rnid:
-            pd = self._register_peer(
-                peer_id=rnid,
-                leaf_macs=[
-                    src_mac,
-                ],
-            )
-            self._root_sw_tbl[src_mac] = pd
-            self.logger.debug(
-                f"learn sw:{self.name}, leaf_mac:{src_mac}, ingress:{in_port}, peerid:{rnid}"
-            )
-        elif in_port in self._leaf_prts:
-            self._leaf_macs.add(src_mac)
-            self.logger.debug(
-                f"learn sw:{self.name}, leaf_mac:{src_mac}, ingress:{in_port}"
-            )
-
-    @property
-    def local_leaf_macs(self):
-        return self._leaf_macs
 
     def leaf_macs(self, node_id):
         if node_id is None:
@@ -995,7 +996,8 @@ class BoundedFlood(app_manager.RyuApp):
             elif sw.ingress_contains(eth.dst):
                 """Vanilla Ethernet frame and forwarding data is available for its destination
                 MAC"""
-                self._forward_frame(msg.datapath, pkt, in_port, msg)
+                out_port = sw.get_ingress_port(eth.dst)
+                self._forward_frame(msg.datapath, out_port, pkt, in_port, msg)
             else:
                 """Vanilla Ethernet frame but the destination MAC is not in our LT. Currently, only
                 broadcast addresses originating from local leaf ports are broadcasted using FRB.
@@ -1005,20 +1007,22 @@ class BoundedFlood(app_manager.RyuApp):
                 if in_port in sw.leaf_ports and is_multiricepient(eth.dst):
                     self._broadcast_frame(msg.datapath, pkt, in_port, msg)
                 elif in_port not in sw.leaf_ports and is_multiricepient(eth.dst):
-                    self.logger.info(
-                        "Raw multirecipient frame ingressed on peer port, discarding frame. "
-                        "Ingress=%s/%s",
-                        sw.name,
-                        in_port,
-                    )
+                    if self.logger.isEnabledFor(logging.INFO):
+                        self.logger.info(
+                            "Raw multirecipient frame ingressed on peer port, discarding frame. "
+                            "Ingress=%s/%s",
+                            sw.name,
+                            in_port,
+                        )
                 else:
-                    self.logger.info(
-                        "No forwarding route to %s in LT, discarding frame. "
-                        "Ingress=%s/%s",
-                        eth.dst,
-                        sw.name,
-                        in_port,
-                    )
+                    if self.logger.isEnabledFor(logging.INFO):
+                        self.logger.info(
+                            "No forwarding route to %s in LT, discarding frame. "
+                            "Ingress=%s/%s",
+                            eth.dst,
+                            sw.name,
+                            in_port,
+                        )
                 return
         except Exception as err:
             self.logger.exception(
@@ -1146,12 +1150,10 @@ class BoundedFlood(app_manager.RyuApp):
                                     Opcode.OND_REQUEST, dpid, sw.overlay_id, tunnel_ops
                                 )
                             )
-                    # hub.sleep(self._link_check_interval)
             except Exception as err:
                 self.logger.exception(
                     "An exception occurred within check links. %s", err
                 )
-                # hub.sleep(self._link_check_interval)
 
     ##################################################################################
     ##################################################################################
@@ -1646,6 +1648,47 @@ class BoundedFlood(app_manager.RyuApp):
             if not resp:
                 self.logger.warning("Send FRB operation failed, OFPPacketOut=%s", out)
 
+    def do_bf_forwarding(
+        self,
+        datapath,
+        out_port,
+        pkt,
+    ):
+        eth = pkt.protocols[0]
+        # src = eth.src
+        # dpid = datapath.id
+        parser = datapath.ofproto_parser
+        rcvd_frb: FloodRouteBound = pkt.protocols[1]
+        # payload = None
+        # port: PortDescriptor
+        # sw: EvioSwitch = self._lt[dpid]
+        # if len(pkt.protocols) == 3:
+        #     payload = pkt.protocols[2]
+
+        rcvd_frb.hop_count += 1
+        pkt.serialize()
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        acts = [parser.OFPActionOutput(out_port)]
+        pkt_out = parser.OFPPacketOut(
+            datapath=datapath,
+            buffer_id=ofproto.OFP_NO_BUFFER,
+            actions=acts,
+            data=pkt.data,
+            in_port=ofproto.OFPP_LOCAL,
+        )
+        resp = datapath.send_msg(pkt_out)
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                "BF frame forwarding %s from %s->%s/%s",
+                pkt.data,
+                eth.src,
+                out_port,
+                eth.dst,
+            )
+        if not resp:
+            self.logger.warning("Failed to forward FRB, OFPPacketOut=%s", pkt_out)
+
     def do_bf_leaf_transfer(self, datapath, ports):
         sw: EvioSwitch = self._lt[datapath.id]
         nid = sw.node_id
@@ -1698,7 +1741,7 @@ class BoundedFlood(app_manager.RyuApp):
                     "FRB leaf exchange failed, OFPPacketOut=%s", pkt_out
                 )
 
-    def handle_bounded_flood_msg(self, datapath, pkt, in_port, msg):
+    def handle_bounded_flood_msg(self, datapath, pkt: packet.Packet, in_port, msg):
         eth = pkt.protocols[0]
         src = eth.src
         dpid = datapath.id
@@ -1714,13 +1757,42 @@ class BoundedFlood(app_manager.RyuApp):
             return
         if rcvd_frb.frb_type not in (
             FloodRouteBound.FRB_BRDCST,
+            FloodRouteBound.FRB_FWD,
             FloodRouteBound.FRB_LNK_CHK,
             FloodRouteBound.FRB_LNK_ACK,
         ):
             # discard these types
-            self.logger.info(f"Discarded type {rcvd_frb.frb_type} FRB")
+            self.logger.info("Discarded type %s FRB: %s", rcvd_frb.frb_type, rcvd_frb)
             return
         port = sw.port_descriptor(in_port)
+        if rcvd_frb.frb_type == FloodRouteBound.FRB_FWD:
+            self.logger.debug(
+                "Received pendant update %s/%s %s", sw.name, in_port, rcvd_frb
+            )
+            # learn a mac address
+            sw.set_ingress_port(src, (in_port, rcvd_frb.root_nid))
+            sw.peer(rcvd_frb.root_nid).hop_count = rcvd_frb.hop_count
+            sw.max_hops = rcvd_frb.hop_count
+            # deliver or forward the FRB
+            if eth.dst in sw.local_leaf_macs:
+                out_port = sw.get_ingress_port(eth.dst)
+                self.logger.debug("Delivering to local port %s, %s", out_port, rcvd_frb)
+                actions = [parser.OFPActionOutput(out_port)]
+                out = parser.OFPPacketOut(
+                    datapath=datapath,
+                    buffer_id=msg.buffer_id,
+                    in_port=in_port,
+                    actions=actions,
+                    data=payload,
+                )
+                datapath.send_msg(out)
+            else:
+                out_port = sw.get_ingress_port(eth.dst)
+                if out_port is not None:
+                    self.do_bf_forwarding(datapath, out_port, pkt)
+                else:
+                    self.logger.warning("No forwarding port for FRB %s", rcvd_frb)
+            return
         if rcvd_frb.frb_type == FloodRouteBound.FRB_LNK_CHK:
             self._do_link_ack(datapath, port)
             if not port.is_activated:
@@ -1761,16 +1833,30 @@ class BoundedFlood(app_manager.RyuApp):
         if out_bounds:
             self.do_bounded_flood(datapath, in_port, out_bounds, src, payload)
 
-    def _forward_frame(self, datapath, pkt, in_port, msg):
+    def _forward_frame(self, datapath, out_port: int, pkt, in_port: int, msg):
+        """
+        A forwarding port for the destination MAC is necessary precondition for forwarding.
+        When ingress occurs on a local port forward using a FRB which allows peers to build
+        their RNID database.
+        """
         eth = pkt.protocols[0]
         dpid = datapath.id
         parser = datapath.ofproto_parser
         ofproto = datapath.ofproto
         sw: EvioSwitch = self._lt[dpid]
-        out_port = sw.get_ingress_port(eth.dst)
         # learn a mac address
         sw.set_ingress_port(eth.src, in_port)
-        if out_port:
+        data = None
+        if msg.buffer_id == ofproto.OFP_NO_BUFFER:
+            data = msg.data
+        self._do_frb_fwd(datapath, out_port, eth.dst, eth.src, data, in_port)
+
+        if in_port in sw.leaf_ports:
+            self._do_frb_fwd(datapath, out_port, eth.dst, eth.src, data, in_port)
+        else:
+            self.logger.exception(
+                "Unexpected: Ingressed  vanilla Ethernet frame on peer port"
+            )
             # create new flow rule
             actions = [parser.OFPActionOutput(out_port)]
             match = parser.OFPMatch(in_port=in_port, eth_dst=eth.dst, eth_src=eth.src)
@@ -1778,9 +1864,6 @@ class BoundedFlood(app_manager.RyuApp):
                 datapath, match, actions, priority=1, tblid=0, idle=sw.idle_timeout
             )
             # forward frame to destination
-            data = None
-            if msg.buffer_id == ofproto.OFP_NO_BUFFER:
-                data = msg.data
             out = parser.OFPPacketOut(
                 datapath=datapath,
                 buffer_id=msg.buffer_id,
@@ -1789,6 +1872,52 @@ class BoundedFlood(app_manager.RyuApp):
                 data=data,
             )
             datapath.send_msg(out)
+
+    def _do_frb_fwd(
+        self,
+        datapath,
+        out_port: int,
+        eth_dst: str,
+        eth_src: str,
+        payload,
+        in_port: Optional[int] = None,
+    ):
+        sw: EvioSwitch = self._lt[datapath.id]
+        nid = sw.node_id
+
+        bf_hdr = FloodRouteBound(nid, nid, 1, FloodRouteBound.FRB_FWD)
+        eth = ethernet.ethernet(
+            dst=eth_dst, src=eth_src, ethertype=FloodRouteBound.ETH_TYPE_BF
+        )
+        p = packet.Packet()
+        p.add_protocol(eth)
+        p.add_protocol(bf_hdr)
+        p.add_protocol(payload)
+        p.serialize()
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        acts = [parser.OFPActionOutput(out_port)]
+        pkt_out = parser.OFPPacketOut(
+            datapath=datapath,
+            buffer_id=ofproto.OFP_NO_BUFFER,
+            actions=acts,
+            data=p.data,
+            in_port=ofproto.OFPP_LOCAL,
+        )
+        resp = datapath.send_msg(pkt_out)
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                "BF frame forwarding %s from %s/%s->%s/%s",
+                sw.name,
+                in_port,
+                eth_src,
+                out_port,
+                eth_dst,
+            )
+        if not resp:
+            self.logger.warning(
+                "Failed to send pendant transfer FRB, OFPPacketOut=%s", pkt_out
+            )
 
     def _broadcast_frame(self, datapath, pkt, in_port, msg):
         eth = pkt.protocols[0]
